@@ -48,8 +48,13 @@ app.use(cors());
 const PAYSTACK_BASE_URL = "https://api.paystack.co";
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET;
 
-// Price for premium access, in pesewas (GHS 20.00 = 2000).
-const INTERMEDIATE_PRICE_PESEWAS = 2000;
+// Pricing: GHS 40.00 the first time someone pays, GHS 25.00 to renew
+// each year after that. Determined server-side by checking whether an
+// entitlement document already exists for this uid -- never trust the
+// client to say which price applies.
+const FIRST_YEAR_PRICE_PESEWAS = 4000;
+const RENEWAL_PRICE_PESEWAS = 2500;
+const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 const CURRENCY = "GHS";
 
 const NETWORK_MAP = {
@@ -90,6 +95,19 @@ app.post("/initiateMomoPayment", express.json(), requireAuth, async (req, res) =
   }
 
   const uid = req.uid;
+
+  // Whether an entitlement doc already exists (even if expired) tells us
+  // this is a renewal, not a first-time purchase -- checked server-side
+  // so a modified client can't claim the cheaper renewal price.
+  const entitlementRef = db
+    .collection("users")
+    .doc(uid)
+    .collection("entitlements")
+    .doc("premium");
+  const entitlementDoc = await entitlementRef.get();
+  const isRenewal = entitlementDoc.exists;
+  const amount = isRenewal ? RENEWAL_PRICE_PESEWAS : FIRST_YEAR_PRICE_PESEWAS;
+
   const reference = `premium_${uid}_${Date.now()}`;
 
   try {
@@ -101,11 +119,11 @@ app.post("/initiateMomoPayment", express.json(), requireAuth, async (req, res) =
       },
       body: JSON.stringify({
         email: `${uid}@richmousghsl.app`,
-        amount: INTERMEDIATE_PRICE_PESEWAS,
+        amount,
         currency: CURRENCY,
         reference,
         mobile_money: { phone, provider: NETWORK_MAP[network] },
-        metadata: { uid, product: "premium_access" },
+        metadata: { uid, product: "premium_access", isRenewal },
       }),
     });
 
@@ -118,16 +136,19 @@ app.post("/initiateMomoPayment", express.json(), requireAuth, async (req, res) =
     await db.collection("payments").doc(reference).set({
       uid,
       reference,
-      amount: INTERMEDIATE_PRICE_PESEWAS,
+      amount,
       currency: CURRENCY,
+      isRenewal,
       status: "pending",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     res.json({
       reference,
-      status: result.data.status,
+      status: result.data.status, // e.g. "send_otp", "pay_offline", "success"
       displayText: result.data.display_text || "Check your phone to approve the payment.",
+      amount,
+      isRenewal,
     });
   } catch (err) {
     console.error(err);
@@ -178,7 +199,7 @@ app.post("/paystackWebhook", express.raw({ type: "application/json" }), async (r
   const signature = req.headers["x-paystack-signature"];
   const expectedSignature = crypto
     .createHmac("sha512", PAYSTACK_SECRET)
-    .update(req.body)
+    .update(req.body) // raw Buffer -- exactly what Paystack signed
     .digest("hex");
 
   if (signature !== expectedSignature) {
@@ -198,10 +219,14 @@ app.post("/paystackWebhook", express.raw({ type: "application/json" }), async (r
         { merge: true }
       );
 
+      const now = admin.firestore.Timestamp.now();
+      const expiresAt = admin.firestore.Timestamp.fromMillis(now.toMillis() + ONE_YEAR_MS);
+
       await db.collection("users").doc(uid).collection("entitlements").doc("premium").set({
         active: true,
         reference,
         grantedAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt,
       });
     }
   }
@@ -209,6 +234,8 @@ app.post("/paystackWebhook", express.raw({ type: "application/json" }), async (r
   res.status(200).send("ok");
 });
 
+// Simple health check so you can confirm the server is alive by just
+// visiting the URL in a browser.
 app.get("/", (req, res) => {
   res.send("Richmous GhSL MoMo backend is running.");
 });
