@@ -48,11 +48,15 @@ app.use(cors());
 const PAYSTACK_BASE_URL = "https://api.paystack.co";
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET;
 
-// Pricing: GHS 40.00 the first time someone pays, GHS 25.00 to renew
-// each year after that. Determined server-side by checking whether an
-// entitlement document already exists for this uid -- never trust the
-// client to say which price applies.
-const FIRST_YEAR_PRICE_PESEWAS = 4000;
+// Pricing: GHS 50.00 the first time someone genuinely PAYS, GHS 25.00
+// to renew each year after that. Determined server-side by checking
+// the explicit `everActivated` flag -- NOT just whether an entitlement
+// document exists. A free trial or a Temporary Learner Code also
+// creates that same document (with an expiry date) but must never be
+// mistaken for a real payment, or a trial user would be charged the
+// cheaper renewal price the first time they actually pay. Never trust
+// the client to say which price applies.
+const FIRST_YEAR_PRICE_PESEWAS = 5000;
 const RENEWAL_PRICE_PESEWAS = 2500;
 const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 const CURRENCY = "GHS";
@@ -96,16 +100,20 @@ app.post("/initiateMomoPayment", express.json(), requireAuth, async (req, res) =
 
   const uid = req.uid;
 
-  // Whether an entitlement doc already exists (even if expired) tells us
-  // this is a renewal, not a first-time purchase -- checked server-side
-  // so a modified client can't claim the cheaper renewal price.
+  // "Renewal" means this uid has genuinely PAID before -- checked via
+  // the explicit `everActivated` flag, which only the webhook below
+  // (a real, confirmed Paystack payment) or the instructor's Grant
+  // Premium action ever sets. A trial or Temporary Learner Code also
+  // creates this document but never sets that flag, so it correctly
+  // still counts as a first-time purchase.
   const entitlementRef = db
     .collection("users")
     .doc(uid)
     .collection("entitlements")
     .doc("premium");
   const entitlementDoc = await entitlementRef.get();
-  const isRenewal = entitlementDoc.exists;
+  const entitlementData = entitlementDoc.exists ? entitlementDoc.data() : null;
+  const isRenewal = !!(entitlementData && entitlementData.everActivated === true);
   const amount = isRenewal ? RENEWAL_PRICE_PESEWAS : FIRST_YEAR_PRICE_PESEWAS;
 
   const reference = `premium_${uid}_${Date.now()}`;
@@ -222,12 +230,22 @@ app.post("/paystackWebhook", express.raw({ type: "application/json" }), async (r
       const now = admin.firestore.Timestamp.now();
       const expiresAt = admin.firestore.Timestamp.fromMillis(now.toMillis() + ONE_YEAR_MS);
 
-      await db.collection("users").doc(uid).collection("entitlements").doc("premium").set({
-        active: true,
-        reference,
-        grantedAt: admin.firestore.FieldValue.serverTimestamp(),
-        expiresAt,
-      });
+      // merge:true preserves any existing fields (e.g. trialUsed) that
+      // a prior free trial or Temporary Learner Code may have set --
+      // a real payment should add to a student's history, not erase it.
+      // everActivated:true is the ONLY thing that ever marks this uid
+      // as having genuinely paid, which is what makes future renewals
+      // (here and in the app's own price display) correctly cheaper.
+      await db.collection("users").doc(uid).collection("entitlements").doc("premium").set(
+        {
+          active: true,
+          everActivated: true,
+          reference,
+          grantedAt: admin.firestore.FieldValue.serverTimestamp(),
+          expiresAt,
+        },
+        { merge: true }
+      );
     }
   }
 
